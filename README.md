@@ -8,7 +8,7 @@ entry point: moe_fp8.cu::run
 source commit: 9400819
 ```
 
-This repo intentionally contains only `kernel/` and this README. It is a development snapshot, not a standalone FlashInfer starter-kit checkout: use it by copying `kernel/` into a runner workspace that has `config.toml`, `verify.py`, and the build-env patch for CUTLASS/TRTLLM include paths.
+This repo contains the kernel snapshot plus the uv environment files needed to recreate the Python stack. It is still not a standalone FlashInfer starter-kit checkout: use it by copying `kernel/` into a runner workspace that has `config.toml`, `verify.py`, and the build-env patch for CUTLASS/TRTLLM include paths.
 
 ## GEMM Routing
 
@@ -70,6 +70,8 @@ So GEMM2 is TRTLLM BMM in the recorded benchmark. Our CUTLASS GEMM2 code exists 
 ## Files
 
 ```text
+pyproject.toml
+uv.lock
 kernel/
   moe_fp8.cu                         # routing, packing, pruning, graph/cache, non-GEMM CUDA kernels
   cutlass_gemm.cu                    # our CUTLASS grouped FP8 blockwise GEMM implementation
@@ -80,9 +82,9 @@ kernel/
 
 ## Environment
 
-The uv setup follows the MIT Kernel Mafia release README/reproduction notes.
+The uv setup follows the MIT Kernel Mafia release README/reproduction notes. This repo includes the matching `pyproject.toml` and `uv.lock`.
 
-From a runner workspace with `pyproject.toml`/`uv.lock` equivalent to the original ablation workspace:
+From this repo root:
 
 ```bash
 git clone https://github.com/flashinfer-ai/flashinfer-bench.git /tmp/flashinfer-bench-main

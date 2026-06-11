@@ -1,0 +1,25 @@
+[project]
+name = "moe-fp8-workspace"
+version = "0.0.1"
+description = "Agent workspace for MoE FP8 block-scale kernel search (MLSys 2026 FlashInfer NVIDIA track)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flashinfer-bench>=0.1.2",
+    "flashinfer-python==0.6.8.post1",
+    "ninja>=1.13.0",
+    "omegaconf>=2.3.0",
+    "torch>=2.12.0",
+]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+override-dependencies = ["triton==3.6.0"]
+
+[[tool.uv.index]]
+name = "pytorch-test-cu132"
+url = "https://download.pytorch.org/whl/test/cu132"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-test-cu132" }]
+flashinfer-bench = { path = "/tmp/flashinfer-bench-main", editable = true }
