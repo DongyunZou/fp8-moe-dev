@@ -1,117 +1,166 @@
-# FP8 MoE Big-Shape Kernel Snapshot
+# FP8 MoE Kernel Snapshot
 
-This directory is a minimal kernel snapshot from:
+CUDA/C++ snapshot for:
 
-- source repo: `/home/dongyun/workspace/projects/ablation/fp8_moe`
-- source commit: `9400819`
-- starter-kit commit used for rule/context checks: `75ccd05`
-- benchmark source: `profile/current_all19_verify_py/summary.json`
+```text
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+entry point: moe_fp8.cu::run
+source commit: 9400819
+```
 
-Only two things are included here:
+This repo intentionally contains only `kernel/` and this README. It is a development snapshot, not a standalone FlashInfer starter-kit checkout: use it by copying `kernel/` into a runner workspace that has `config.toml`, `verify.py`, and the build-env patch for CUTLASS/TRTLLM include paths.
 
-- `kernel/`: CUDA/C++ source files needed by the current kernel
-- `README.md`: this note, dependencies, run commands, and per-shape results
+## GEMM Routing
 
-## What This Version Does
+The MoE path has two matrix multiplies:
 
-The entry point is `moe_fp8.cu::run`.
+- **GEMM1**: `hidden -> 2 * intermediate`, before SwiGLU.
+- **GEMM2**: `intermediate -> hidden`, after SwiGLU and FP8 requant.
 
-This is a hybrid implementation:
+Current defaults in `kernel/moe_fp8.cu`:
 
-- Small and medium shapes use the existing TRTLLM/FlashInfer BMM path for selected GEMM phases.
-- Large shapes use our CUTLASS grouped FP8 blockwise GEMM1 path from `cutlass_gemm.cu`.
-- Routing, packing, pruning, SwiGLU/quantization, scatter/reduce, descriptor construction, and graph/cache logic live in `moe_fp8.cu`.
+```text
+MOE_USE_TRTLLM_BMM_GEMM1 = 1
+MOE_USE_TRTLLM_BMM_GEMM2 = 1
+MOE_MMA_GEMM2_M_THRESHOLD = 0
+MOE_TRTLLM_BMM_GEMM2_M_THRESHOLD = 20000
+```
 
-Important routing details:
+GEMM1 branch:
 
-- GEMM1 uses TRTLLM BMM only when `T <= 80`, or `901 <= T < 10000`, or very small `M_total_unpadded <= 128`, with `T=7` explicitly excluded.
-- Therefore the official large shapes `T=11948` and `T=14107` take the custom CUTLASS grouped FP8 GEMM1 path.
-- GEMM2 still uses the existing TRTLLM BMM path when `M_total_unpadded <= 20000`; otherwise it falls back to the CUTLASS grouped FP8 path.
+```text
+TRTLLM BMM if:
+  trtllm_bmm_available
+  M_total_unpadded > 0
+  T != 7
+  and (M_total_unpadded <= 128 or T <= 80 or 901 <= T < 10000)
 
-So the large-shape speedups below are not from a pure all-BMM solution: the large-shape GEMM1 path is our own CUTLASS-based kernel path.
+otherwise:
+  our CUTLASS grouped FP8 blockwise GEMM in cutlass_gemm.cu
+```
+
+So the two large official shapes use our GEMM1:
+
+```text
+T=11948 -> CUTLASS grouped FP8 GEMM1
+T=14107 -> CUTLASS grouped FP8 GEMM1
+```
+
+GEMM2 branch:
+
+```text
+TRTLLM BMM if:
+  trtllm_bmm_available
+  M_total_unpadded > 0
+  M_total_unpadded <= 20000
+
+our CUTLASS grouped FP8 GEMM2 only if:
+  TRTLLM BMM is unavailable/disabled, or M_total_unpadded > 20000
+```
+
+For the recorded v34 run on the official 19 workloads, **GEMM2 did not use our CUTLASS path**. The routed `M_total_unpadded` stays below `20000` for all 19 shapes, including the two large shapes:
+
+```text
+T=11948 -> M_total_unpadded ~= 8830
+T=14107 -> M_total_unpadded ~= 13428
+```
+
+So GEMM2 is TRTLLM BMM in the recorded benchmark. Our CUTLASS GEMM2 code exists and is wired as a fallback, but it is not responsible for the recorded 1.4x result.
 
 ## Files
 
 ```text
 kernel/
-  moe_fp8.cu
-  cutlass_gemm.cu
-  trtllm_fp8_bmm.cu
-  trtllm_batched_gemm_runner.cu
-  envUtils.cpp
-  logger.cpp
-  stringUtils.cpp
-  tllmException.cpp
+  moe_fp8.cu                         # routing, packing, pruning, graph/cache, non-GEMM CUDA kernels
+  cutlass_gemm.cu                    # our CUTLASS grouped FP8 blockwise GEMM implementation
+  trtllm_fp8_bmm.cu                  # adapter into TRTLLM/FlashInfer generated BMM cubins
+  trtllm_batched_gemm_runner.cu      # TRTLLM BMM runner glue
+  envUtils.cpp logger.cpp stringUtils.cpp tllmException.cpp
 ```
 
-## Dependencies
+## Environment
 
-Runtime/test environment used locally:
+The uv setup follows the MIT Kernel Mafia release README/reproduction notes.
 
-- NVIDIA B200 / SM100-capable GPU
-- CUDA 13.2-era toolchain with `nvcc` support for `sm_100a`
-- Python environment with `flashinfer-bench`, `flashinfer`, `tvm_ffi`, PyTorch CUDA build
-- FlashInfer packaged CUTLASS headers:
-  - `flashinfer/data/cutlass/include`
-  - `flashinfer/data/cutlass/tools/util/include`
-- FlashInfer/TensorRT-LLM BMM generated headers and cubins in the local cache:
-  - `~/.cache/flashinfer/cubins/*/batched_gemm-*/include/trtllmGen_bmm_export`
-  - `Bmm_Bfloat16_E4m3E4m3*noShflA*dsFp8*dynB*.cubin`
-- Link flags include `-lcuda -ldl`.
+From a runner workspace with `pyproject.toml`/`uv.lock` equivalent to the original ablation workspace:
 
-The local benchmark wrapper in the source repo patches the build environment to add these include paths, `TVM_FFI_CUDA_ARCH_LIST=10.0a`, `--expt-relaxed-constexpr`, and `TLLM_GEN_GEMM_CUBIN_PATH`.
+```bash
+git clone https://github.com/flashinfer-ai/flashinfer-bench.git /tmp/flashinfer-bench-main
+uv sync
 
-## How To Run And Benchmark
+# Required by the contest stack and by submissions using CUTLASS/CuTe headers.
+git clone https://github.com/deepseek-ai/DeepGEMM.git /tmp/DeepGEMM
+uv pip install -e /tmp/DeepGEMM --no-build-isolation
 
-The minimal snapshot intentionally does not include the full starter-kit or local helper scripts. To benchmark this exact version, place the files in a FlashInfer-bench CUDA solution directory with:
+# Dataset path; alternatively use the runner's download script.
+export FIB_DATASET_PATH=/path/to/flashinfer-trace
+```
+
+Expected pinned stack:
 
 ```text
+Python >= 3.12
+flashinfer-python == 0.6.8.post1
+torch >= 2.12.0 from the CUDA 13.2 PyTorch index
+triton == 3.6.0
+ninja >= 1.13.0
+flashinfer-bench from /tmp/flashinfer-bench-main
+```
+
+The runner must also add these build settings before `tvm_ffi` compiles the CUDA extension:
+
+```text
+TVM_FFI_CUDA_ARCH_LIST=10.0a
+CUDA flags:
+  -I $flashinfer/data/cutlass/include
+  -I $flashinfer/data/cutlass/tools/util/include
+  -I FlashInfer/TRTLLM BMM generated headers
+  --expt-relaxed-constexpr
+  -DTLLM_ENABLE_CUDA
+  -DTLLM_GEN_EXPORT_INTERFACE
+  -DTLLM_GEN_EXPORT_FLASHINFER
+  -DTLLM_GEN_GEMM_CUBIN_PATH="..."
+link flags:
+  -lcuda -ldl
+```
+
+In the local ablation workspace this is handled by `verify.py`.
+
+## Run
+
+Use a runner workspace whose `config.toml` has:
+
+```toml
 [build]
 language = "cuda"
 entry_point = "moe_fp8.cu::run"
 destination_passing_style = true
 ```
 
-The exact local command used from the source workspace is:
+Copy this repo's kernel files into the runner:
+
+```bash
+rm -rf /path/to/runner/solution/cuda
+mkdir -p /path/to/runner/solution
+cp -r /path/to/fp8-moe-dev/kernel /path/to/runner/solution/cuda
+```
+
+Then benchmark:
+
+```bash
+cd /path/to/runner
+uv run python verify.py --all --baseline
+```
+
+The local command used for the recorded run was equivalent to:
 
 ```bash
 cd /home/dongyun/workspace/projects/ablation/fp8_moe
-
-PY=/home/dongyun/workspace/projects/fp8-moe/.venv/bin/python
-export PYTHONPATH=/home/dongyun/.cache/uv/archive-v0/PN6qqGHi_dhz5nCMR4zKI
-
-python3 /home/dongyun/workspace/skills/gpu-lock-skill/scripts/gpu_lock.py run \
-  --gpu 0 \
-  --timeout 45m \
-  --owner "$USER-fp8-moe-bench" \
-  -- \
-  env PYTHONPATH="$PYTHONPATH" \
-  "$PY" verify.py --all --baseline \
-    --dump-json profile/current_all19_verify_py/summary.json
+uv run python verify.py --all --baseline \
+  --dump-json profile/current_all19_verify_py/summary.json
 ```
 
-To smoke-test only the two large shapes on the agent kernel:
-
-```bash
-cd /home/dongyun/workspace/projects/ablation/fp8_moe
-
-PY=/home/dongyun/workspace/projects/fp8-moe/.venv/bin/python
-export PYTHONPATH=/home/dongyun/.cache/uv/archive-v0/PN6qqGHi_dhz5nCMR4zKI
-
-python3 /home/dongyun/workspace/skills/gpu-lock-skill/scripts/gpu_lock.py run \
-  --gpu 0 \
-  --timeout 30m \
-  --owner "$USER-fp8-moe-bigshape" \
-  -- \
-  env PYTHONPATH="$PYTHONPATH" \
-  "$PY" verify.py \
-    --uuid 58a34f27 \
-    --uuid 5e8dc11c
-```
-
-For large-shape speedup numbers, prefer the full `--all --baseline` command above. In a fresh large-only run on 2026-06-11, the agent passed both large workloads, but the FlashInfer baseline hit the benchmark runner's 300s timeout on both large workloads. The per-shape baseline numbers below therefore come from the successful full 19-workload benchmark summary.
-
-MoE correctness tolerance used by `verify.py`:
+MoE tolerance:
 
 ```text
 atol = 1.0
@@ -119,40 +168,34 @@ rtol = 0.3
 required_matched_ratio = 0.9
 ```
 
-## Full Benchmark Summary
+## Results
 
-Measured against FlashInfer baseline `flashinfer_wrapper_9sdjf3` on all 19 workloads:
-
-```text
-baseline mean latency: 493.728 us
-agent mean latency:    335.394 us
-ratio of means:        1.472x
-mean per-shape speedup: 1.444x
-min per-shape speedup:  1.264x
-correctness:           19/19 PASSED
-```
-
-Large-shape aggregate:
+Measured against FlashInfer baseline `flashinfer_wrapper_9sdjf3`:
 
 ```text
-T=11948 and T=14107 ratio of summed baseline/agent latency: 1.585x
-large-shape mean per-shape speedup:                         1.587x
+correctness:             19/19 PASSED
+baseline mean latency:   493.728 us
+agent mean latency:      335.394 us
+ratio of means:          1.472x
+mean per-shape speedup:  1.444x
+min per-shape speedup:   1.264x
 ```
 
-Large-shape agent-only smoke rerun on 2026-06-11:
+Large shapes:
 
 ```text
-T=11948: 1123.027 us, PASSED
-T=14107: 1532.356 us, PASSED
-FlashInfer baseline in that large-only rerun: TIMEOUT at 300s for both shapes
+T=11948: 1786.778 us -> 1119.045 us, 1.597x, GEMM1 = our CUTLASS path
+T=14107: 2409.706 us -> 1528.301 us, 1.577x, GEMM1 = our CUTLASS path
+GEMM2 for both large shapes = TRTLLM BMM
+large-shape summed-latency speedup: 1.585x
 ```
 
-## Per-Shape Speedup
+Per-shape table:
 
 | seq_len | uuid | baseline us | agent us | speedup | GEMM1 path |
 |---:|---|---:|---:|---:|---|
 | 1 | `e05c6c03` | 203.425 | 108.255 | 1.879x | TRTLLM BMM |
-| 7 | `b8f4f012` | 212.457 | 143.990 | 1.475x | CUTLASS grouped FP8 |
+| 7 | `b8f4f012` | 212.457 | 143.990 | 1.475x | our CUTLASS |
 | 14 | `8cba5890` | 265.967 | 174.308 | 1.526x | TRTLLM BMM |
 | 15 | `2e69caee` | 202.835 | 114.267 | 1.775x | TRTLLM BMM |
 | 16 | `a7c2bcfd` | 254.074 | 179.555 | 1.415x | TRTLLM BMM |
@@ -168,5 +211,5 @@ FlashInfer baseline in that large-only rerun: TIMEOUT at 300s for both shapes
 | 62 | `5eadab1e` | 294.599 | 207.190 | 1.422x | TRTLLM BMM |
 | 80 | `8f1ff9f1` | 366.890 | 287.478 | 1.276x | TRTLLM BMM |
 | 901 | `1a4c6ba1` | 459.392 | 337.650 | 1.361x | TRTLLM BMM |
-| 11948 | `58a34f27` | 1786.778 | 1119.045 | 1.597x | CUTLASS grouped FP8 |
-| 14107 | `5e8dc11c` | 2409.706 | 1528.301 | 1.577x | CUTLASS grouped FP8 |
+| 11948 | `58a34f27` | 1786.778 | 1119.045 | 1.597x | our CUTLASS |
+| 14107 | `5e8dc11c` | 2409.706 | 1528.301 | 1.577x | our CUTLASS |
